@@ -6,25 +6,18 @@ import fitz
 from app.schemas.upload_schema import AnswerPreview, QuestionPreview
 
 
-QUESTION_PATTERN = re.compile(r"^\s*(\d+)[\.\)](?:\s+(.*\S)\s*)?$")
-LETTER_ANSWER_PATTERN = re.compile(r"^\s*([a-jA-J])[\.\)]\s+(.*\S)\s*$")
 NUMBERED_LINE_PATTERN = re.compile(r"^\s*(\d+)[\.\)]\s+(.*\S)\s*$")
+LETTER_ANSWER_PATTERN = re.compile(r"^\s*([a-jA-J])[\.\)]\s+(.*\S)\s*$")
 PAGE_NUMBER_PATTERN = re.compile(r"^\s*\d+\s*$")
 
 MAX_NUMERIC_ANSWER_LABEL = 10
 
 
 def normalize_text(text: str) -> str:
-    """Elimină spațiile repetate și marginile inutile."""
     return re.sub(r"\s+", " ", text).strip()
 
 
 def extract_page_lines(page: fitz.Page, page_number: int) -> list[dict]:
-    """
-    Extrage liniile de text și coordonatele lor.
-    Coordonatele sunt necesare pentru asocierea highlight-ului
-    cu varianta de răspuns.
-    """
     page_dict = page.get_text("dict")
     lines: list[dict] = []
 
@@ -53,48 +46,31 @@ def extract_page_lines(page: fitz.Page, page_number: int) -> list[dict]:
 
 
 def color_is_visible_highlight(color) -> bool:
-    """
-    Acceptă aproape orice culoare vizibilă folosită ca marker.
-    Exclude alb, negru și griuri foarte neutre.
-    PyMuPDF returnează culori în intervalul 0-1.
-    """
-    if not color:
-        return False
-
-    if len(color) < 3:
+    if not color or len(color) < 3:
         return False
 
     red, green, blue = color[:3]
 
-    # Excludem alb / aproape alb.
     if red > 0.92 and green > 0.92 and blue > 0.92:
         return False
 
-    # Excludem negru / aproape negru.
     if red < 0.12 and green < 0.12 and blue < 0.12:
         return False
 
-    # Excludem griuri neutre.
-    max_channel = max(red, green, blue)
-    min_channel = min(red, green, blue)
-
-    if max_channel - min_channel < 0.08:
+    if max(red, green, blue) - min(red, green, blue) < 0.08:
         return False
 
     return True
 
 
 def extract_annotation_highlights(document: fitz.Document) -> dict[int, list[fitz.Rect]]:
-    """
-    Găsește adnotările PDF de tip Highlight.
-    Culoarea nu este verificată: orice highlight înseamnă răspuns corect.
-    """
     highlights_by_page: dict[int, list[fitz.Rect]] = {}
 
     for page_index, page in enumerate(document, start=1):
         page_highlights: list[fitz.Rect] = []
 
         annotation = page.first_annot
+
         while annotation:
             annotation_name = annotation.type[1].lower()
 
@@ -109,32 +85,29 @@ def extract_annotation_highlights(document: fitz.Document) -> dict[int, list[fit
 
 
 def extract_drawn_highlights(document: fitz.Document) -> dict[int, list[fitz.Rect]]:
-    """
-    Găsește highlight-uri desenate direct în PDF, nu salvate ca adnotări.
-    Asta acoperă PDF-uri exportate de pe iPad sau din aplicații care lipesc
-    culoarea ca dreptunghi peste/sub text.
-    """
     highlights_by_page: dict[int, list[fitz.Rect]] = {}
 
     for page_index, page in enumerate(document, start=1):
         page_highlights: list[fitz.Rect] = []
 
         for drawing in page.get_drawings():
-            fill_color = drawing.get("fill")
-            stroke_color = drawing.get("color")
             rect = drawing.get("rect")
 
             if rect is None:
                 continue
 
-            highlight_color = fill_color if color_is_visible_highlight(fill_color) else stroke_color
+            fill_color = drawing.get("fill")
+            stroke_color = drawing.get("color")
 
-            if not color_is_visible_highlight(highlight_color):
+            has_highlight_color = color_is_visible_highlight(
+                fill_color
+            ) or color_is_visible_highlight(stroke_color)
+
+            if not has_highlight_color:
                 continue
 
             highlight_rect = fitz.Rect(rect)
 
-            # Evităm linii decorative foarte mici.
             if highlight_rect.width < 8 or highlight_rect.height < 2:
                 continue
 
@@ -149,10 +122,10 @@ def merge_highlights(
     annotation_highlights: dict[int, list[fitz.Rect]],
     drawn_highlights: dict[int, list[fitz.Rect]],
 ) -> dict[int, list[fitz.Rect]]:
-    all_pages = set(annotation_highlights.keys()) | set(drawn_highlights.keys())
+    page_numbers = set(annotation_highlights.keys()) | set(drawn_highlights.keys())
     merged: dict[int, list[fitz.Rect]] = {}
 
-    for page_number in all_pages:
+    for page_number in page_numbers:
         merged[page_number] = [
             *annotation_highlights.get(page_number, []),
             *drawn_highlights.get(page_number, []),
@@ -161,17 +134,7 @@ def merge_highlights(
     return merged
 
 
-def line_is_highlighted(
-    line_rect: fitz.Rect,
-    highlights: list[fitz.Rect],
-) -> bool:
-    """
-    Verifică dacă o linie este acoperită suficient de un highlight.
-
-    Nu folosim doar simpla atingere a dreptunghiurilor, deoarece markerul
-    poate ajunge foarte puțin peste linia vecină și ar produce răspunsuri
-    corecte false.
-    """
+def line_is_highlighted(line_rect: fitz.Rect, highlights: list[fitz.Rect]) -> bool:
     for highlight_rect in highlights:
         intersection = line_rect & highlight_rect
 
@@ -181,7 +144,11 @@ def line_is_highlighted(
         vertical_coverage = intersection.height / max(line_rect.height, 1)
         horizontal_coverage = intersection.width / max(line_rect.width, 1)
 
-        if intersection.width > 2 and vertical_coverage >= 0.25 and horizontal_coverage >= 0.12:
+        if (
+            intersection.width > 2
+            and vertical_coverage >= 0.20
+            and horizontal_coverage >= 0.08
+        ):
             return True
 
     return False
@@ -191,10 +158,6 @@ def answer_is_highlighted(
     answer_lines: list[dict],
     highlights_by_page: dict[int, list[fitz.Rect]],
 ) -> bool:
-    """
-    O variantă poate ocupa mai multe rânduri sau poate continua pe pagina
-    următoare. Este corectă dacă minimum o linie a sa are highlight.
-    """
     for line in answer_lines:
         page_highlights = highlights_by_page.get(line["page"], [])
 
@@ -204,46 +167,11 @@ def answer_is_highlighted(
     return False
 
 
-def looks_like_question_text(text: str) -> bool:
-    """
-    În documentele cu variante 1-10, și întrebările și variantele încep cu număr.
-    Folosim indicii simple ca să separăm întrebarea de variante.
-    """
-    normalized = normalize_text(text).lower()
-
-    if not normalized:
-        return False
-
-    if normalized.endswith(":"):
-        return True
-
-    question_keywords = [
-        "sunt:",
-        "este:",
-        "cuprind:",
-        "cuprinde:",
-        "se poate spune",
-        "sunt adevărate",
-        "sunt false",
-        "nu sunt",
-        "se recomandă",
-        "se evită",
-        "fac parte",
-        "se regăsesc",
-        "următoarele",
-        "referitor la",
-        "despre",
-        "printre",
-    ]
-
-    return any(keyword in normalized for keyword in question_keywords)
-
-
-def start_new_question(
+def start_question(
     raw_questions: list[dict],
     current_question: dict | None,
     question_number: int,
-    question_text: str | None,
+    question_text: str,
     page_number: int,
 ) -> dict:
     if current_question is not None:
@@ -251,55 +179,77 @@ def start_new_question(
 
     return {
         "number": question_number,
-        "text": normalize_text(question_text or ""),
+        "text": normalize_text(question_text),
         "answers": [],
         "source_pages": [page_number],
     }
 
 
-def add_answer_to_question(
+def add_answer(
     current_question: dict,
     label: str,
     answer_text: str,
     line: dict,
     page_number: int,
 ) -> dict:
-    current_answer = {
+    answer = {
         "label": str(label).lower(),
         "text": normalize_text(answer_text),
         "lines": [line],
         "source_page": page_number,
     }
 
-    current_question["answers"].append(current_answer)
+    current_question["answers"].append(answer)
 
     if page_number not in current_question["source_pages"]:
         current_question["source_pages"].append(page_number)
 
-    return current_answer
+    return answer
+
+
+def get_next_expected_numeric_answer(current_question: dict) -> int:
+    numeric_answers = []
+
+    for answer in current_question["answers"]:
+        try:
+            numeric_answers.append(int(answer["label"]))
+        except ValueError:
+            continue
+
+    if not numeric_answers:
+        return 1
+
+    return max(numeric_answers) + 1
+
+
+def should_start_new_question_from_number(
+    current_question: dict,
+    line_number: int,
+) -> bool:
+    answers_count = len(current_question["answers"])
+
+    if answers_count >= MAX_NUMERIC_ANSWER_LABEL:
+        return True
+
+    expected_answer_number = get_next_expected_numeric_answer(current_question)
+
+    if 1 <= line_number <= MAX_NUMERIC_ANSWER_LABEL:
+        return line_number != expected_answer_number
+
+    return True
 
 
 def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], list[str]]:
-    """
-    Extrage întrebările și răspunsurile corecte dintr-un PDF cu text
-    selectabil și răspunsuri marcate prin highlight.
-
-    Suportă:
-    - întrebări numerotate: 1. / 2. / 3.
-    - variante cu litere: a. / b. / c.
-    - variante numerotate: 1. / 2. / ... / 10.
-    - highlight-uri PDF reale
-    - highlight-uri desenate direct în pagină, de exemplu roșu/galben din iPad
-    """
     warnings: list[str] = []
     raw_questions: list[dict] = []
     current_question: dict | None = None
     current_answer: dict | None = None
 
     with fitz.open(str(file_path)) as document:
-        annotation_highlights = extract_annotation_highlights(document)
-        drawn_highlights = extract_drawn_highlights(document)
-        highlights_by_page = merge_highlights(annotation_highlights, drawn_highlights)
+        highlights_by_page = merge_highlights(
+            extract_annotation_highlights(document),
+            extract_drawn_highlights(document),
+        )
 
         for page_number, page in enumerate(document, start=1):
             lines = extract_page_lines(page, page_number)
@@ -313,7 +263,7 @@ def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], l
                 letter_answer_match = LETTER_ANSWER_PATTERN.match(text)
 
                 if current_question is not None and letter_answer_match:
-                    current_answer = add_answer_to_question(
+                    current_answer = add_answer(
                         current_question=current_question,
                         label=letter_answer_match.group(1),
                         answer_text=letter_answer_match.group(2),
@@ -329,7 +279,7 @@ def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], l
                     line_text = numbered_match.group(2)
 
                     if current_question is None:
-                        current_question = start_new_question(
+                        current_question = start_question(
                             raw_questions=raw_questions,
                             current_question=current_question,
                             question_number=line_number,
@@ -339,11 +289,11 @@ def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], l
                         current_answer = None
                         continue
 
-                    has_answers = len(current_question["answers"]) > 0
-                    is_possible_numeric_answer = 1 <= line_number <= MAX_NUMERIC_ANSWER_LABEL
-
-                    if has_answers and looks_like_question_text(line_text):
-                        current_question = start_new_question(
+                    if should_start_new_question_from_number(
+                        current_question,
+                        line_number,
+                    ):
+                        current_question = start_question(
                             raw_questions=raw_questions,
                             current_question=current_question,
                             question_number=line_number,
@@ -353,37 +303,13 @@ def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], l
                         current_answer = None
                         continue
 
-                    if is_possible_numeric_answer:
-                        current_answer = add_answer_to_question(
-                            current_question=current_question,
-                            label=str(line_number),
-                            answer_text=line_text,
-                            line=line,
-                            page_number=page_number,
-                        )
-                        continue
-
-                    current_question = start_new_question(
-                        raw_questions=raw_questions,
+                    current_answer = add_answer(
                         current_question=current_question,
-                        question_number=line_number,
-                        question_text=line_text,
+                        label=str(line_number),
+                        answer_text=line_text,
+                        line=line,
                         page_number=page_number,
                     )
-                    current_answer = None
-                    continue
-
-                question_match = QUESTION_PATTERN.match(text)
-
-                if question_match:
-                    current_question = start_new_question(
-                        raw_questions=raw_questions,
-                        current_question=current_question,
-                        question_number=int(question_match.group(1)),
-                        question_text=question_match.group(2),
-                        page_number=page_number,
-                    )
-                    current_answer = None
                     continue
 
                 if current_question is None:
