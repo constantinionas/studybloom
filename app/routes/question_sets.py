@@ -7,6 +7,8 @@ from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, 
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 
+from pydantic import BaseModel, Field
+
 from app.config.supabase_client import (
     download_storage_file,
     request_supabase,
@@ -16,6 +18,91 @@ from app.schemas.question_set_schema import QuestionSetResponse
 
 
 router = APIRouter(prefix="/api/question-sets", tags=["Fișiere importate"])
+
+
+class QuestionCorrectionRequest(BaseModel):
+    correct_answer_labels: list[str] = Field(min_length=1)
+
+
+def normalize_answer_labels(labels: list[str]) -> list[str]:
+    normalized_labels: list[str] = []
+
+    for label in labels:
+        normalized_label = str(label).strip().lower()
+
+        if normalized_label and normalized_label not in normalized_labels:
+            normalized_labels.append(normalized_label)
+
+    return normalized_labels
+
+
+def question_number_matches(question: dict, question_number: int) -> bool:
+    possible_numbers = [
+        question.get("number"),
+        question.get("originQuestionNumber"),
+        question.get("origin_question_number"),
+    ]
+
+    for possible_number in possible_numbers:
+        try:
+            if int(possible_number) == int(question_number):
+                return True
+        except (TypeError, ValueError):
+            continue
+
+    return False
+
+
+def question_origin_matches(
+    question: dict,
+    question_set_id: str,
+    question_number: int,
+    *,
+    direct_question_set_id: str | None = None,
+) -> bool:
+    if direct_question_set_id == question_set_id and question_number_matches(
+        question,
+        question_number,
+    ):
+        return True
+
+    origin_question_set_id = (
+        question.get("originQuestionSetId")
+        or question.get("origin_question_set_id")
+    )
+
+    if origin_question_set_id != question_set_id:
+        return False
+
+    return question_number_matches(question, question_number)
+
+
+def apply_correct_labels_to_question(
+    question: dict,
+    correct_answer_labels: list[str],
+) -> dict:
+    correct_label_set = set(correct_answer_labels)
+
+    return {
+        **question,
+        "answers": [
+            {
+                **answer,
+                "correct": str(answer.get("label", "")).strip().lower()
+                in correct_label_set,
+            }
+            for answer in question.get("answers", [])
+        ],
+    }
+
+
+def count_correct_answers(questions: list[dict]) -> int:
+    return sum(
+        1
+        for question in questions
+        for answer in question.get("answers", [])
+        if answer.get("correct")
+    )
 
 
 def get_question_set_or_404(question_set_id: str) -> dict:
@@ -189,6 +276,132 @@ async def create_question_set(
     finally:
         if source_file is not None:
             await source_file.close()
+
+
+
+@router.patch("/{question_set_id}/questions/{question_number}/correct-answers")
+def update_question_correct_answers(
+    question_set_id: str,
+    question_number: int,
+    payload: QuestionCorrectionRequest,
+) -> dict:
+    question_set = get_question_set_or_404(question_set_id)
+    correct_answer_labels = normalize_answer_labels(payload.correct_answer_labels)
+
+    if not correct_answer_labels:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selectează cel puțin un răspuns corect.",
+        )
+
+    questions = question_set.get("questions", [])
+    corrected_question: dict | None = None
+    updated_questions: list[dict] = []
+
+    for question in questions:
+        if question_number_matches(question, question_number):
+            available_labels = {
+                str(answer.get("label", "")).strip().lower()
+                for answer in question.get("answers", [])
+            }
+
+            invalid_labels = [
+                label
+                for label in correct_answer_labels
+                if label not in available_labels
+            ]
+
+            if invalid_labels:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "Unele variante selectate nu există la această întrebare: "
+                        + ", ".join(invalid_labels)
+                    ),
+                )
+
+            corrected_question = apply_correct_labels_to_question(
+                question,
+                correct_answer_labels,
+            )
+            updated_questions.append(corrected_question)
+        else:
+            updated_questions.append(question)
+
+    if corrected_question is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Întrebarea nu a fost găsită în setul original.",
+        )
+
+    try:
+        updated_question_sets = request_supabase(
+            "PATCH",
+            "question_sets",
+            params={"id": f"eq.{question_set_id}"},
+            json_data={
+                "questions": updated_questions,
+                "correct_answers_count": count_correct_answers(updated_questions),
+            },
+            return_representation=True,
+        )
+
+        quizzes = request_supabase(
+            "GET",
+            "quizzes",
+            params={
+                "subject_id": f"eq.{question_set['subject_id']}",
+                "select": "*",
+            },
+        )
+
+        updated_quizzes_count = 0
+
+        for quiz in quizzes:
+            quiz_questions = quiz.get("questions", [])
+            changed_quiz = False
+            updated_quiz_questions: list[dict] = []
+
+            for quiz_question in quiz_questions:
+                if question_origin_matches(
+                    quiz_question,
+                    question_set_id,
+                    question_number,
+                    direct_question_set_id=quiz.get("question_set_id"),
+                ):
+                    updated_quiz_questions.append(
+                        apply_correct_labels_to_question(
+                            quiz_question,
+                            correct_answer_labels,
+                        )
+                    )
+                    changed_quiz = True
+                else:
+                    updated_quiz_questions.append(quiz_question)
+
+            if changed_quiz:
+                request_supabase(
+                    "PATCH",
+                    "quizzes",
+                    params={"id": f"eq.{quiz['id']}"},
+                    json_data={"questions": updated_quiz_questions},
+                )
+                updated_quizzes_count += 1
+
+        return {
+            "question_set": updated_question_sets[0]
+            if updated_question_sets
+            else None,
+            "corrected_question": corrected_question,
+            "correct_answer_labels": correct_answer_labels,
+            "updated_quizzes_count": updated_quizzes_count,
+        }
+
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Corectarea întrebării nu a putut fi salvată: {str(exc)}",
+        ) from exc
 
 
 @router.get("/{question_set_id}/source")

@@ -7,6 +7,7 @@ from app.routes.upload import router as upload_router
 from app.routes.question_sets import router as question_sets_router
 from app.routes.attempts import router as attempts_router
 from app.routes.quizzes import router as quizzes_router
+from app.routes.favorites import router as favorites_router
 
 
 app = FastAPI(
@@ -26,12 +27,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 app.include_router(upload_router)
 app.include_router(database_test_router)
 app.include_router(subjects_router)
 app.include_router(question_sets_router)
 app.include_router(quizzes_router)
 app.include_router(attempts_router)
+app.include_router(favorites_router)
 
 
 @app.get("/")
