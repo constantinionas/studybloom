@@ -6,15 +6,42 @@ import fitz
 from app.schemas.upload_schema import AnswerPreview, QuestionPreview
 
 
-NUMBERED_LINE_PATTERN = re.compile(r"^\s*(\d+)[\.\)]\s+(.*\S)\s*$")
-LETTER_ANSWER_PATTERN = re.compile(r"^\s*([a-jA-J])[\.\)]\s+(.*\S)\s*$")
+QUESTION_PATTERN = re.compile(r"^\s*(\d+)[\.\)](?:\s+(.*\S)\s*)?$")
+ANSWER_PATTERN = re.compile(r"^\s*([a-jA-J])[\.\)]\s+(.*\S)\s*$")
+ANSWER_LABEL_ONLY_PATTERN = re.compile(r"^\s*([a-jA-J])[\.\)]\s*$")
 PAGE_NUMBER_PATTERN = re.compile(r"^\s*\d+\s*$")
 
-MAX_NUMERIC_ANSWER_LABEL = 10
+I_QUESTION_PATTERN = re.compile(
+    r"^\s*[IÎl]\s*(\d+)\s+(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+CORRECT_WRONG_ANSWER_PATTERN = re.compile(
+    r"^\s*([a-jA-J])[\.\)]\s+(.+?)\s+(Corect|Greșit|Gresit)\s*$",
+    re.IGNORECASE,
+)
+
+VERDICT_ONLY_PATTERN = re.compile(
+    r"^(.*?)(?:\s+)(Corect|Greșit|Gresit)\s*$",
+    re.IGNORECASE,
+)
 
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_verdict(text: str) -> str:
+    return (
+        text.lower()
+        .replace("ș", "s")
+        .replace("ş", "s")
+        .replace("ă", "a")
+        .replace("â", "a")
+        .replace("î", "i")
+        .replace("ț", "t")
+        .replace("ţ", "t")
+    )
 
 
 def extract_page_lines(page: fitz.Page, page_number: int) -> list[dict]:
@@ -45,32 +72,74 @@ def extract_page_lines(page: fitz.Page, page_number: int) -> list[dict]:
     return lines
 
 
-def color_is_visible_highlight(color) -> bool:
-    if not color or len(color) < 3:
-        return False
+def extract_page_rows(page: fitz.Page, page_number: int) -> list[dict]:
+    """
+    Grupează liniile după poziția verticală.
 
-    red, green, blue = color[:3]
+    În unele PDF-uri cu tabele, PyMuPDF citește separat celulele:
+    I1 | text întrebare | CORECT/GREȘIT
+    a. | text răspuns | Corect
 
-    if red > 0.92 and green > 0.92 and blue > 0.92:
-        return False
+    Funcția asta le pune înapoi pe același rând:
+    I1 text întrebare CORECT/GREȘIT
+    a. text răspuns Corect
+    """
+    lines = extract_page_lines(page, page_number)
+    rows: list[list[dict]] = []
 
-    if red < 0.12 and green < 0.12 and blue < 0.12:
-        return False
+    current_row: list[dict] = []
+    current_y: float | None = None
+    y_tolerance = 3.2
 
-    if max(red, green, blue) - min(red, green, blue) < 0.08:
-        return False
+    for line in lines:
+        line_y = line["bbox"].y0
 
-    return True
+        if current_y is None:
+            current_row = [line]
+            current_y = line_y
+            continue
+
+        if abs(line_y - current_y) <= y_tolerance:
+            current_row.append(line)
+            current_y = (current_y * 0.7) + (line_y * 0.3)
+        else:
+            rows.append(current_row)
+            current_row = [line]
+            current_y = line_y
+
+    if current_row:
+        rows.append(current_row)
+
+    merged_rows: list[dict] = []
+
+    for row in rows:
+        row.sort(key=lambda item: item["bbox"].x0)
+
+        row_text = normalize_text(" ".join(item["text"] for item in row))
+
+        row_bbox = fitz.Rect(row[0]["bbox"])
+        for item in row[1:]:
+            row_bbox |= item["bbox"]
+
+        merged_rows.append(
+            {
+                "text": row_text,
+                "bbox": row_bbox,
+                "page": page_number,
+                "parts": row,
+            }
+        )
+
+    return merged_rows
 
 
-def extract_annotation_highlights(document: fitz.Document) -> dict[int, list[fitz.Rect]]:
+def extract_highlights(document: fitz.Document) -> dict[int, list[fitz.Rect]]:
     highlights_by_page: dict[int, list[fitz.Rect]] = {}
 
     for page_index, page in enumerate(document, start=1):
         page_highlights: list[fitz.Rect] = []
 
         annotation = page.first_annot
-
         while annotation:
             annotation_name = annotation.type[1].lower()
 
@@ -84,57 +153,10 @@ def extract_annotation_highlights(document: fitz.Document) -> dict[int, list[fit
     return highlights_by_page
 
 
-def extract_drawn_highlights(document: fitz.Document) -> dict[int, list[fitz.Rect]]:
-    highlights_by_page: dict[int, list[fitz.Rect]] = {}
-
-    for page_index, page in enumerate(document, start=1):
-        page_highlights: list[fitz.Rect] = []
-
-        for drawing in page.get_drawings():
-            rect = drawing.get("rect")
-
-            if rect is None:
-                continue
-
-            fill_color = drawing.get("fill")
-            stroke_color = drawing.get("color")
-
-            has_highlight_color = color_is_visible_highlight(
-                fill_color
-            ) or color_is_visible_highlight(stroke_color)
-
-            if not has_highlight_color:
-                continue
-
-            highlight_rect = fitz.Rect(rect)
-
-            if highlight_rect.width < 8 or highlight_rect.height < 2:
-                continue
-
-            page_highlights.append(highlight_rect)
-
-        highlights_by_page[page_index] = page_highlights
-
-    return highlights_by_page
-
-
-def merge_highlights(
-    annotation_highlights: dict[int, list[fitz.Rect]],
-    drawn_highlights: dict[int, list[fitz.Rect]],
-) -> dict[int, list[fitz.Rect]]:
-    page_numbers = set(annotation_highlights.keys()) | set(drawn_highlights.keys())
-    merged: dict[int, list[fitz.Rect]] = {}
-
-    for page_number in page_numbers:
-        merged[page_number] = [
-            *annotation_highlights.get(page_number, []),
-            *drawn_highlights.get(page_number, []),
-        ]
-
-    return merged
-
-
-def line_is_highlighted(line_rect: fitz.Rect, highlights: list[fitz.Rect]) -> bool:
+def line_is_highlighted(
+    line_rect: fitz.Rect,
+    highlights: list[fitz.Rect],
+) -> bool:
     for highlight_rect in highlights:
         intersection = line_rect & highlight_rect
 
@@ -142,13 +164,8 @@ def line_is_highlighted(line_rect: fitz.Rect, highlights: list[fitz.Rect]) -> bo
             continue
 
         vertical_coverage = intersection.height / max(line_rect.height, 1)
-        horizontal_coverage = intersection.width / max(line_rect.width, 1)
 
-        if (
-            intersection.width > 2
-            and vertical_coverage >= 0.20
-            and horizontal_coverage >= 0.08
-        ):
+        if intersection.width > 2 and vertical_coverage >= 0.35:
             return True
 
     return False
@@ -167,210 +184,310 @@ def answer_is_highlighted(
     return False
 
 
-def start_question(
-    raw_questions: list[dict],
-    current_question: dict | None,
-    question_number: int,
-    question_text: str,
-    page_number: int,
-) -> dict:
-    if current_question is not None:
-        raw_questions.append(current_question)
+def clean_i_question_text(text: str) -> str:
+    text = normalize_text(text)
 
-    return {
-        "number": question_number,
-        "text": normalize_text(question_text),
-        "answers": [],
-        "source_pages": [page_number],
-    }
+    text = re.sub(
+        r"\s*CORECT\s*/\s*GREȘIT\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\s*CORECT\s*/\s*GRESIT\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\s*Corect\s*/\s*greșit\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\s*Corect\s*/\s*gresit\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
 
-
-def add_answer(
-    current_question: dict,
-    label: str,
-    answer_text: str,
-    line: dict,
-    page_number: int,
-) -> dict:
-    answer = {
-        "label": str(label).lower(),
-        "text": normalize_text(answer_text),
-        "lines": [line],
-        "source_page": page_number,
-    }
-
-    current_question["answers"].append(answer)
-
-    if page_number not in current_question["source_pages"]:
-        current_question["source_pages"].append(page_number)
-
-    return answer
+    return normalize_text(text)
 
 
-def get_next_expected_numeric_answer(current_question: dict) -> int:
-    numeric_answers = []
-
-    for answer in current_question["answers"]:
-        try:
-            numeric_answers.append(int(answer["label"]))
-        except ValueError:
-            continue
-
-    if not numeric_answers:
-        return 1
-
-    return max(numeric_answers) + 1
-
-
-def should_start_new_question_from_number(
-    current_question: dict,
-    line_number: int,
-) -> bool:
-    answers_count = len(current_question["answers"])
-
-    if answers_count >= MAX_NUMERIC_ANSWER_LABEL:
-        return True
-
-    expected_answer_number = get_next_expected_numeric_answer(current_question)
-
-    if 1 <= line_number <= MAX_NUMERIC_ANSWER_LABEL:
-        return line_number != expected_answer_number
-
-    return True
-
-
-def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], list[str]]:
+def parse_i_correct_wrong_pdf(
+    document: fitz.Document,
+) -> tuple[list[QuestionPreview], list[str]]:
     warnings: list[str] = []
     raw_questions: list[dict] = []
     current_question: dict | None = None
     current_answer: dict | None = None
 
-    with fitz.open(str(file_path)) as document:
-        highlights_by_page = merge_highlights(
-            extract_annotation_highlights(document),
-            extract_drawn_highlights(document),
-        )
-
-        for page_number, page in enumerate(document, start=1):
-            lines = extract_page_lines(page, page_number)
-
-            for line in lines:
-                text = line["text"]
-
-                if PAGE_NUMBER_PATTERN.match(text):
-                    continue
-
-                letter_answer_match = LETTER_ANSWER_PATTERN.match(text)
-
-                if current_question is not None and letter_answer_match:
-                    current_answer = add_answer(
-                        current_question=current_question,
-                        label=letter_answer_match.group(1),
-                        answer_text=letter_answer_match.group(2),
-                        line=line,
-                        page_number=page_number,
-                    )
-                    continue
-
-                numbered_match = NUMBERED_LINE_PATTERN.match(text)
-
-                if numbered_match:
-                    line_number = int(numbered_match.group(1))
-                    line_text = numbered_match.group(2)
-
-                    if current_question is None:
-                        current_question = start_question(
-                            raw_questions=raw_questions,
-                            current_question=current_question,
-                            question_number=line_number,
-                            question_text=line_text,
-                            page_number=page_number,
-                        )
-                        current_answer = None
-                        continue
-
-                    if should_start_new_question_from_number(
-                        current_question,
-                        line_number,
-                    ):
-                        current_question = start_question(
-                            raw_questions=raw_questions,
-                            current_question=current_question,
-                            question_number=line_number,
-                            question_text=line_text,
-                            page_number=page_number,
-                        )
-                        current_answer = None
-                        continue
-
-                    current_answer = add_answer(
-                        current_question=current_question,
-                        label=str(line_number),
-                        answer_text=line_text,
-                        line=line,
-                        page_number=page_number,
-                    )
-                    continue
-
-                if current_question is None:
-                    continue
-
-                if current_answer is not None:
-                    current_answer["text"] = normalize_text(
-                        f'{current_answer["text"]} {text}'
-                    )
-                    current_answer["lines"].append(line)
-
-                    if page_number not in current_question["source_pages"]:
-                        current_question["source_pages"].append(page_number)
-                else:
-                    current_question["text"] = normalize_text(
-                        f'{current_question["text"]} {text}'
-                    )
-
-                    if page_number not in current_question["source_pages"]:
-                        current_question["source_pages"].append(page_number)
+    def finish_current_question() -> None:
+        nonlocal current_question
 
         if current_question is not None:
             raw_questions.append(current_question)
 
-        parsed_questions: list[QuestionPreview] = []
+    for page_number, page in enumerate(document, start=1):
+        rows = extract_page_rows(page, page_number)
 
-        for raw_question in raw_questions:
-            answers: list[AnswerPreview] = []
+        for row in rows:
+            text = row["text"]
 
-            for raw_answer in raw_question["answers"]:
-                answers.append(
-                    AnswerPreview(
-                        label=raw_answer["label"],
-                        text=raw_answer["text"],
-                        correct=answer_is_highlighted(
-                            raw_answer["lines"],
-                            highlights_by_page,
-                        ),
-                        source_page=raw_answer["source_page"],
-                    )
-                )
-
-            if not answers:
-                warnings.append(
-                    f'Întrebarea {raw_question["number"]} nu are variante detectate.'
-                )
+            if not text or PAGE_NUMBER_PATTERN.match(text):
                 continue
 
-            if not any(answer.correct for answer in answers):
-                warnings.append(
-                    f'Întrebarea {raw_question["number"]} nu are niciun răspuns evidențiat detectat.'
+            normalized_lower = normalize_verdict(text)
+
+            if normalized_lower in {
+                "corect / gresit",
+                "corect/gresit",
+                "corect",
+                "gresit",
+            }:
+                continue
+
+            question_match = I_QUESTION_PATTERN.match(text)
+
+            if question_match:
+                finish_current_question()
+
+                current_question = {
+                    "number": int(question_match.group(1)),
+                    "text": clean_i_question_text(question_match.group(2)),
+                    "answers": [],
+                    "source_pages": [page_number],
+                }
+                current_answer = None
+                continue
+
+            if current_question is None:
+                continue
+
+            answer_match = CORRECT_WRONG_ANSWER_PATTERN.match(text)
+
+            if answer_match:
+                label = answer_match.group(1).lower()
+                answer_text = normalize_text(answer_match.group(2))
+                verdict = normalize_verdict(answer_match.group(3))
+
+                current_answer = {
+                    "label": label,
+                    "text": answer_text,
+                    "correct": verdict == "corect",
+                    "source_page": page_number,
+                }
+
+                current_question["answers"].append(current_answer)
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+
+                continue
+
+            label_only_match = ANSWER_LABEL_ONLY_PATTERN.match(text)
+
+            if label_only_match:
+                current_answer = {
+                    "label": label_only_match.group(1).lower(),
+                    "text": "",
+                    "correct": False,
+                    "source_page": page_number,
+                }
+
+                current_question["answers"].append(current_answer)
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+
+                continue
+
+            verdict_match = VERDICT_ONLY_PATTERN.match(text)
+
+            if current_answer is not None and verdict_match:
+                continuation_text = normalize_text(verdict_match.group(1))
+                verdict = normalize_verdict(verdict_match.group(2))
+
+                if continuation_text:
+                    current_answer["text"] = normalize_text(
+                        f'{current_answer["text"]} {continuation_text}'
+                    )
+
+                current_answer["correct"] = verdict == "corect"
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+
+                continue
+
+            if current_answer is not None:
+                current_answer["text"] = normalize_text(
+                    f'{current_answer["text"]} {text}'
                 )
 
-            parsed_questions.append(
-                QuestionPreview(
-                    number=raw_question["number"],
-                    text=raw_question["text"],
-                    answers=answers,
-                    source_pages=raw_question["source_pages"],
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+            else:
+                current_question["text"] = normalize_text(
+                    f'{current_question["text"]} {text}'
+                )
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+
+    finish_current_question()
+
+    parsed_questions: list[QuestionPreview] = []
+
+    for raw_question in raw_questions:
+        answers = [
+            AnswerPreview(
+                label=answer["label"],
+                text=answer["text"],
+                correct=answer["correct"],
+                source_page=answer["source_page"],
+            )
+            for answer in raw_question["answers"]
+            if normalize_text(answer["text"])
+        ]
+
+        if not answers:
+            warnings.append(
+                f'Întrebarea {raw_question["number"]} nu are variante detectate.'
+            )
+            continue
+
+        if not any(answer.correct for answer in answers):
+            warnings.append(
+                f'Întrebarea {raw_question["number"]} nu are niciun răspuns corect detectat.'
+            )
+
+        parsed_questions.append(
+            QuestionPreview(
+                number=raw_question["number"],
+                text=raw_question["text"],
+                answers=answers,
+                source_pages=raw_question["source_pages"],
+            )
+        )
+
+    if not parsed_questions:
+        warnings.append("Nu am găsit întrebări de tip I1 Corect/Gresit în PDF.")
+
+    return parsed_questions, warnings
+
+
+def parse_highlight_pdf(
+    document: fitz.Document,
+) -> tuple[list[QuestionPreview], list[str]]:
+    warnings: list[str] = []
+    raw_questions: list[dict] = []
+    current_question: dict | None = None
+    current_answer: dict | None = None
+
+    highlights_by_page = extract_highlights(document)
+
+    for page_number, page in enumerate(document, start=1):
+        lines = extract_page_lines(page, page_number)
+
+        for line in lines:
+            text = line["text"]
+
+            if PAGE_NUMBER_PATTERN.match(text):
+                continue
+
+            question_match = QUESTION_PATTERN.match(text)
+
+            if question_match:
+                if current_question is not None:
+                    raw_questions.append(current_question)
+
+                current_question = {
+                    "number": int(question_match.group(1)),
+                    "text": question_match.group(2),
+                    "answers": [],
+                    "source_pages": [page_number],
+                }
+                current_answer = None
+                continue
+
+            if current_question is None:
+                continue
+
+            answer_match = ANSWER_PATTERN.match(text)
+
+            if answer_match:
+                current_answer = {
+                    "label": answer_match.group(1).lower(),
+                    "text": answer_match.group(2),
+                    "lines": [line],
+                    "source_page": page_number,
+                }
+
+                current_question["answers"].append(current_answer)
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+
+                continue
+
+            if current_answer is not None:
+                current_answer["text"] = normalize_text(
+                    f'{current_answer["text"]} {text}'
+                )
+                current_answer["lines"].append(line)
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+            else:
+                current_question["text"] = normalize_text(
+                    f'{current_question["text"]} {text}'
+                )
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+
+    if current_question is not None:
+        raw_questions.append(current_question)
+
+    parsed_questions: list[QuestionPreview] = []
+
+    for raw_question in raw_questions:
+        answers: list[AnswerPreview] = []
+
+        for raw_answer in raw_question["answers"]:
+            answers.append(
+                AnswerPreview(
+                    label=raw_answer["label"],
+                    text=raw_answer["text"],
+                    correct=answer_is_highlighted(
+                        raw_answer["lines"],
+                        highlights_by_page,
+                    ),
+                    source_page=raw_answer["source_page"],
                 )
             )
+
+        if not answers:
+            warnings.append(
+                f'Întrebarea {raw_question["number"]} nu are variante detectate.'
+            )
+            continue
+
+        if not any(answer.correct for answer in answers):
+            warnings.append(
+                f'Întrebarea {raw_question["number"]} nu are niciun răspuns evidențiat detectat.'
+            )
+
+        parsed_questions.append(
+            QuestionPreview(
+                number=raw_question["number"],
+                text=raw_question["text"],
+                answers=answers,
+                source_pages=raw_question["source_pages"],
+            )
+        )
 
     if not parsed_questions:
         warnings.append(
@@ -378,3 +495,21 @@ def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], l
         )
 
     return parsed_questions, warnings
+
+
+def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], list[str]]:
+    """
+    Încearcă întâi formatul I1 + Corect/Gresit.
+    Dacă nu găsește întrebări, revine la parserul vechi cu highlight.
+
+    Așa nu stricăm documentele vechi.
+    """
+    with fitz.open(str(file_path)) as document:
+        correct_wrong_questions, correct_wrong_warnings = parse_i_correct_wrong_pdf(
+            document
+        )
+
+        if correct_wrong_questions:
+            return correct_wrong_questions, correct_wrong_warnings
+
+        return parse_highlight_pdf(document)
