@@ -12,6 +12,15 @@ ANSWER_LABEL_ONLY_PATTERN = re.compile(r"^\s*([a-jA-J])[\.\)]\s*$")
 PAGE_NUMBER_PATTERN = re.compile(r"^\s*\d+\s*$")
 NUMERIC_LINE_PATTERN = re.compile(r"^\s*(\d+)[\.\)]\s+(.*\S)\s*$")
 
+SIMPLE_NUMBER_QUESTION_PATTERN = re.compile(
+    r"^\s*(\d+)\s+(.*\S)\s*$"
+)
+
+VERDICT_STANDALONE_PATTERN = re.compile(
+    r"^\s*(Corect|Greșit|Gresit)\s*$",
+    re.IGNORECASE,
+)
+
 I_QUESTION_PATTERN = re.compile(
     r"^\s*[IÎl]\s*(\d+)\s+(.+?)\s*$",
     re.IGNORECASE,
@@ -631,6 +640,254 @@ def parse_numeric_highlight_pdf(
     return parsed_questions, warnings
 
 
+def text_is_document_header(text: str) -> bool:
+    normalized = normalize_verdict(text)
+
+    header_starts = (
+        "facultate:",
+        "an:",
+        "examen:",
+        "numar capitol:",
+        "număr capitol:",
+        "nume capitol:",
+        "cai de administrare",
+        "căi de administrare",
+        "medicamentelor",
+    )
+
+    return normalized.startswith(header_starts)
+
+
+def parse_simple_number_letter_correct_wrong_pdf(
+    document: fitz.Document,
+) -> tuple[list[QuestionPreview], list[str]]:
+    """
+    Parsează formatul:
+    1 Alegeti afirmatiile ADEVARATE...
+    a. Text variantă Corect
+    b. Text variantă Gresit
+
+    Folosește extract_page_rows pentru PDF-uri tabelare, unde PyMuPDF poate
+    separa numărul, textul și verdictul în celule diferite.
+    """
+    warnings: list[str] = []
+    raw_questions: list[dict] = []
+    current_question: dict | None = None
+    current_answer: dict | None = None
+
+    def finish_current_question() -> None:
+        nonlocal current_question
+
+        if current_question is not None:
+            raw_questions.append(current_question)
+
+    def start_question(
+        question_number: int,
+        question_text: str,
+        page_number: int,
+    ) -> None:
+        nonlocal current_question, current_answer
+
+        finish_current_question()
+
+        current_question = {
+            "number": question_number,
+            "text": normalize_text(question_text),
+            "answers": [],
+            "source_pages": [page_number],
+        }
+        current_answer = None
+
+    def add_answer(
+        label: str,
+        answer_text: str,
+        is_correct: bool,
+        page_number: int,
+    ) -> None:
+        nonlocal current_answer
+
+        if current_question is None:
+            return
+
+        current_answer = {
+            "label": label.lower(),
+            "text": normalize_text(answer_text),
+            "correct": is_correct,
+            "source_page": page_number,
+        }
+
+        current_question["answers"].append(current_answer)
+
+        if page_number not in current_question["source_pages"]:
+            current_question["source_pages"].append(page_number)
+
+    for page_number, page in enumerate(document, start=1):
+        rows = extract_page_rows(page, page_number)
+
+        for row in rows:
+            text = row["text"]
+
+            if not text or PAGE_NUMBER_PATTERN.match(text):
+                continue
+
+            if text_is_document_header(text):
+                continue
+
+            normalized_text = normalize_text(text)
+            normalized_lower = normalize_verdict(normalized_text)
+
+            if normalized_lower in {
+                "corect",
+                "gresit",
+                "corect / gresit",
+                "corect/gresit",
+            }:
+                if current_answer is not None:
+                    current_answer["correct"] = normalized_lower == "corect"
+                continue
+
+            # Caz: "1 Alegeti afirmatiile ADEVARATE..."
+            simple_question_match = SIMPLE_NUMBER_QUESTION_PATTERN.match(
+                normalized_text
+            )
+
+            if simple_question_match:
+                question_number = int(simple_question_match.group(1))
+                question_text = normalize_text(simple_question_match.group(2))
+
+                # Întrebare reală dacă textul nu e doar un număr și nu seamănă cu variantă.
+                if question_text and not question_text.lower().startswith(
+                    ("corect", "gresit")
+                ):
+                    start_question(question_number, question_text, page_number)
+                    continue
+
+            # Caz: "a. Text variantă Corect"
+            answer_match = CORRECT_WRONG_ANSWER_PATTERN.match(normalized_text)
+
+            if answer_match and current_question is not None:
+                label = answer_match.group(1)
+                answer_text = normalize_text(answer_match.group(2))
+                verdict = normalize_verdict(answer_match.group(3))
+
+                add_answer(
+                    label=label,
+                    answer_text=answer_text,
+                    is_correct=verdict == "corect",
+                    page_number=page_number,
+                )
+                continue
+
+            # Caz: "a. Text variantă" fără verdict pe același rând
+            answer_match = ANSWER_PATTERN.match(normalized_text)
+
+            if answer_match and current_question is not None:
+                label = answer_match.group(1)
+                answer_body = normalize_text(answer_match.group(2))
+                verdict_match = VERDICT_ONLY_PATTERN.match(answer_body)
+
+                if verdict_match:
+                    answer_text = normalize_text(verdict_match.group(1))
+                    verdict = normalize_verdict(verdict_match.group(2))
+                    is_correct = verdict == "corect"
+                else:
+                    answer_text = answer_body
+                    is_correct = False
+
+                add_answer(
+                    label=label,
+                    answer_text=answer_text,
+                    is_correct=is_correct,
+                    page_number=page_number,
+                )
+                continue
+
+            # Caz: "a." singur într-o celulă
+            label_only_match = ANSWER_LABEL_ONLY_PATTERN.match(normalized_text)
+
+            if label_only_match and current_question is not None:
+                add_answer(
+                    label=label_only_match.group(1),
+                    answer_text="",
+                    is_correct=False,
+                    page_number=page_number,
+                )
+                continue
+
+            # Caz: "Text continuare Corect" sau "Text continuare Gresit"
+            verdict_match = VERDICT_ONLY_PATTERN.match(normalized_text)
+
+            if current_answer is not None and verdict_match:
+                continuation_text = normalize_text(verdict_match.group(1))
+                verdict = normalize_verdict(verdict_match.group(2))
+
+                if continuation_text:
+                    current_answer["text"] = normalize_text(
+                        f'{current_answer["text"]} {continuation_text}'
+                    )
+
+                current_answer["correct"] = verdict == "corect"
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+
+                continue
+
+            # Caz: rând de continuare pentru variantă lungă
+            if current_answer is not None:
+                current_answer["text"] = normalize_text(
+                    f'{current_answer["text"]} {normalized_text}'
+                )
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+
+                continue
+
+            # Caz: rând de continuare pentru întrebare lungă
+            if current_question is not None:
+                current_question["text"] = normalize_text(
+                    f'{current_question["text"]} {normalized_text}'
+                )
+
+                if page_number not in current_question["source_pages"]:
+                    current_question["source_pages"].append(page_number)
+
+    finish_current_question()
+
+    parsed_questions: list[QuestionPreview] = []
+
+    for raw_question in raw_questions:
+        answers = [
+            AnswerPreview(
+                label=answer["label"],
+                text=normalize_text(answer["text"]),
+                correct=answer["correct"],
+                source_page=answer["source_page"],
+            )
+            for answer in raw_question["answers"]
+            if normalize_text(answer["text"])
+        ]
+
+        if len(answers) < 2:
+            continue
+
+        if not any(answer.correct for answer in answers):
+            warnings.append(
+                f'Întrebarea {raw_question["number"]} nu are niciun răspuns corect detectat.'
+            )
+
+        parsed_questions.append(
+            QuestionPreview(
+                number=raw_question["number"],
+                text=normalize_text(raw_question["text"]),
+                answers=answers,
+                source_pages=raw_question["source_pages"],
+            )
+        )
+
+    return parsed_questions, warnings
+
 def parse_highlight_pdf(
     document: fitz.Document,
 ) -> tuple[list[QuestionPreview], list[str]]:
@@ -754,8 +1011,9 @@ def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], l
     """
     Ordine parser:
     1. I1 + Corect/Gresit
-    2. întrebări numerotate + variante 1-10 + highlight verde
-    3. parser vechi cu highlight clasic
+    2. întrebări cu număr simplu + variante a-j + Corect/Gresit
+    3. întrebări numerotate + variante 1-10 + highlight verde
+    4. parser vechi cu highlight clasic
     """
     with fitz.open(str(file_path)) as document:
         correct_wrong_questions, correct_wrong_warnings = parse_i_correct_wrong_pdf(
@@ -764,6 +1022,13 @@ def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], l
 
         if correct_wrong_questions:
             return correct_wrong_questions, correct_wrong_warnings
+
+        simple_number_questions, simple_number_warnings = (
+            parse_simple_number_letter_correct_wrong_pdf(document)
+        )
+
+        if simple_number_questions:
+            return simple_number_questions, simple_number_warnings
 
         numeric_questions, numeric_warnings = parse_numeric_highlight_pdf(document)
 
