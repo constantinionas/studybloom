@@ -169,7 +169,6 @@ def color_is_visible_highlight(color) -> bool:
 
     red, green, blue = color[:3]
 
-    # Excludem alb / negru / gri.
     if red > 0.92 and green > 0.92 and blue > 0.92:
         return False
 
@@ -253,6 +252,7 @@ def line_is_highlighted(
             return True
 
     return False
+
 
 def answer_is_highlighted(
     answer_lines: list[dict],
@@ -535,7 +535,6 @@ def parse_numeric_highlight_pdf(
             if not text or PAGE_NUMBER_PATTERN.match(text):
                 continue
 
-            # Ignorăm zone care nu sunt grile.
             lower_text = normalize_text(text).lower()
 
             if lower_text.startswith("anagen"):
@@ -548,9 +547,6 @@ def parse_numeric_highlight_pdf(
                 line_text = normalize_text(numeric_match.group(2))
 
                 if current_question is None:
-                    # Dacă documentul începe direct cu 1. variantă, nu avem încă întrebare.
-                    # În acest PDF, prima întrebare este linia de dinainte, deci cazul real
-                    # e tratat mai jos prin start_question pe text simplu.
                     start_question(line_number, line_text, page_number)
                     continue
 
@@ -559,8 +555,6 @@ def parse_numeric_highlight_pdf(
                     current_question
                 )
 
-                # Dacă suntem în interiorul unei întrebări și urmează 1-10 în ordine,
-                # linia este variantă de răspuns.
                 if (
                     1 <= line_number <= 10
                     and answers_count < 10
@@ -569,20 +563,15 @@ def parse_numeric_highlight_pdf(
                     add_answer(line_number, line_text, line, page_number)
                     continue
 
-                # Altfel, este întrebare nouă.
                 start_question(line_number, line_text, page_number)
                 continue
 
-            # Linie nenumerotată.
             if current_question is None:
-                # Prima întrebare din grile ergo nu are "1." în față.
-                # O luăm ca întrebarea 1 doar dacă pare enunț de întrebare.
                 if text.endswith(":") or "urmatoarele" in lower_text or "următoarele" in lower_text:
                     start_question(1, text, page_number)
                 continue
 
             if current_answer is not None:
-                # Continuare pentru o variantă lungă pe mai multe rânduri.
                 current_answer["text"] = normalize_text(
                     f'{current_answer["text"]} {text}'
                 )
@@ -591,7 +580,6 @@ def parse_numeric_highlight_pdf(
                 if page_number not in current_question["source_pages"]:
                     current_question["source_pages"].append(page_number)
             else:
-                # Continuare enunț întrebare.
                 current_question["text"] = normalize_text(
                     f'{current_question["text"]} {text}'
                 )
@@ -619,7 +607,6 @@ def parse_numeric_highlight_pdf(
                 )
             )
 
-        # Păstrăm doar întrebările reale, cu minimum 2 variante.
         if len(answers) < 2:
             continue
 
@@ -667,13 +654,14 @@ def parse_simple_number_letter_correct_wrong_pdf(
     a. Text variantă Corect
     b. Text variantă Gresit
 
-    Folosește extract_page_rows pentru PDF-uri tabelare, unde PyMuPDF poate
-    separa numărul, textul și verdictul în celule diferite.
+    Returnează rezultate doar dacă găsește verdicte explicite Corect/Gresit.
+    Astfel nu blochează PDF-urile cu highlight colorat.
     """
     warnings: list[str] = []
     raw_questions: list[dict] = []
     current_question: dict | None = None
     current_answer: dict | None = None
+    explicit_verdicts_found = 0
 
     def finish_current_question() -> None:
         nonlocal current_question
@@ -743,10 +731,10 @@ def parse_simple_number_letter_correct_wrong_pdf(
                 "corect/gresit",
             }:
                 if current_answer is not None:
+                    explicit_verdicts_found += 1
                     current_answer["correct"] = normalized_lower == "corect"
                 continue
 
-            # Caz: "1 Alegeti afirmatiile ADEVARATE..."
             simple_question_match = SIMPLE_NUMBER_QUESTION_PATTERN.match(
                 normalized_text
             )
@@ -755,17 +743,17 @@ def parse_simple_number_letter_correct_wrong_pdf(
                 question_number = int(simple_question_match.group(1))
                 question_text = normalize_text(simple_question_match.group(2))
 
-                # Întrebare reală dacă textul nu e doar un număr și nu seamănă cu variantă.
                 if question_text and not question_text.lower().startswith(
                     ("corect", "gresit")
                 ):
                     start_question(question_number, question_text, page_number)
                     continue
 
-            # Caz: "a. Text variantă Corect"
             answer_match = CORRECT_WRONG_ANSWER_PATTERN.match(normalized_text)
 
             if answer_match and current_question is not None:
+                explicit_verdicts_found += 1
+
                 label = answer_match.group(1)
                 answer_text = normalize_text(answer_match.group(2))
                 verdict = normalize_verdict(answer_match.group(3))
@@ -778,7 +766,6 @@ def parse_simple_number_letter_correct_wrong_pdf(
                 )
                 continue
 
-            # Caz: "a. Text variantă" fără verdict pe același rând
             answer_match = ANSWER_PATTERN.match(normalized_text)
 
             if answer_match and current_question is not None:
@@ -787,6 +774,7 @@ def parse_simple_number_letter_correct_wrong_pdf(
                 verdict_match = VERDICT_ONLY_PATTERN.match(answer_body)
 
                 if verdict_match:
+                    explicit_verdicts_found += 1
                     answer_text = normalize_text(verdict_match.group(1))
                     verdict = normalize_verdict(verdict_match.group(2))
                     is_correct = verdict == "corect"
@@ -802,7 +790,6 @@ def parse_simple_number_letter_correct_wrong_pdf(
                 )
                 continue
 
-            # Caz: "a." singur într-o celulă
             label_only_match = ANSWER_LABEL_ONLY_PATTERN.match(normalized_text)
 
             if label_only_match and current_question is not None:
@@ -814,10 +801,11 @@ def parse_simple_number_letter_correct_wrong_pdf(
                 )
                 continue
 
-            # Caz: "Text continuare Corect" sau "Text continuare Gresit"
             verdict_match = VERDICT_ONLY_PATTERN.match(normalized_text)
 
             if current_answer is not None and verdict_match:
+                explicit_verdicts_found += 1
+
                 continuation_text = normalize_text(verdict_match.group(1))
                 verdict = normalize_verdict(verdict_match.group(2))
 
@@ -833,7 +821,6 @@ def parse_simple_number_letter_correct_wrong_pdf(
 
                 continue
 
-            # Caz: rând de continuare pentru variantă lungă
             if current_answer is not None:
                 current_answer["text"] = normalize_text(
                     f'{current_answer["text"]} {normalized_text}'
@@ -844,7 +831,6 @@ def parse_simple_number_letter_correct_wrong_pdf(
 
                 continue
 
-            # Caz: rând de continuare pentru întrebare lungă
             if current_question is not None:
                 current_question["text"] = normalize_text(
                     f'{current_question["text"]} {normalized_text}'
@@ -886,7 +872,11 @@ def parse_simple_number_letter_correct_wrong_pdf(
             )
         )
 
+    if explicit_verdicts_found == 0:
+        return [], []
+
     return parsed_questions, warnings
+
 
 def parse_highlight_pdf(
     document: fitz.Document,
@@ -896,7 +886,10 @@ def parse_highlight_pdf(
     current_question: dict | None = None
     current_answer: dict | None = None
 
-    highlights_by_page = extract_highlights(document)
+    highlights_by_page = merge_highlights(
+        extract_highlights(document),
+        extract_drawn_highlights(document),
+    )
 
     for page_number, page in enumerate(document, start=1):
         lines = extract_page_lines(page, page_number)
@@ -1012,25 +1005,43 @@ def parse_pdf_questions(file_path: str | Path) -> tuple[list[QuestionPreview], l
     Ordine parser:
     1. I1 + Corect/Gresit
     2. întrebări cu număr simplu + variante a-j + Corect/Gresit
-    3. întrebări numerotate + variante 1-10 + highlight verde
-    4. parser vechi cu highlight clasic
+    3. întrebări 1) + variante a) + highlight colorat
+    4. întrebări numerotate + variante 1-10 + highlight verde
+    5. fallback vechi
     """
     with fitz.open(str(file_path)) as document:
         correct_wrong_questions, correct_wrong_warnings = parse_i_correct_wrong_pdf(
             document
         )
 
-        if correct_wrong_questions:
+        if correct_wrong_questions and len(correct_wrong_questions) >= 20:
             return correct_wrong_questions, correct_wrong_warnings
 
         simple_number_questions, simple_number_warnings = (
             parse_simple_number_letter_correct_wrong_pdf(document)
         )
 
+        if simple_number_questions and len(simple_number_questions) >= 20:
+            return simple_number_questions, simple_number_warnings
+
+        highlight_questions, highlight_warnings = parse_highlight_pdf(document)
+
+        if highlight_questions and len(highlight_questions) >= 20:
+            return highlight_questions, highlight_warnings
+
+        numeric_questions, numeric_warnings = parse_numeric_highlight_pdf(document)
+
+        if numeric_questions and len(numeric_questions) >= 20:
+            return numeric_questions, numeric_warnings
+
+        if correct_wrong_questions:
+            return correct_wrong_questions, correct_wrong_warnings
+
         if simple_number_questions:
             return simple_number_questions, simple_number_warnings
 
-        numeric_questions, numeric_warnings = parse_numeric_highlight_pdf(document)
+        if highlight_questions:
+            return highlight_questions, highlight_warnings
 
         if numeric_questions:
             return numeric_questions, numeric_warnings
